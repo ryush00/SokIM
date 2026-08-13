@@ -50,12 +50,24 @@ class InputMonitor {
     private var inputs: [Input] = []
     private var restartTimer = DispatchWorkItem(block: {})
 
+    var isRunning: Bool { hid != nil }
+
+    func cancelCapsLockHoldTimer() {
+        capsLockTimer.cancel()
+        modifier[.capsLock] = .keyUp
+    }
+
     func start() throws {
         debug()
 
         if hid != nil {
             warning("초기화된 hid가 이미 있음")
             return
+        }
+
+        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+            warning("입력 모니터링 미허용, 시스템 요청")
+            _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
         }
 
         let hid = IOHIDManagerCreate(kCFAllocatorDefault, 0)
@@ -188,52 +200,59 @@ class InputMonitor {
                 appDelegate()?.commit()
             }
 
-            // 별도 처리: 오른쪽 Command: 한/A 표시만 *우선 처리*, 실제 처리는 State에서
+            // 별도 처리: 오른쪽 Command: 한/A 즉시 전환, handle()의 중복 전환은 State에서 건너뜀
             if (type, key) == (.keyDown, .rightCommand)
-                && Preferences.rotateShortcuts.contains(.rightCommand) {
-                appDelegate()?.statusBar.rotateEngine()
+                && Preferences.rotateShortcuts.contains(.rightCommand)
+                && isSokIMCurrentInputSource() {
+                appDelegate()?.rotateFromShortcut()
             }
 
-            // 별도 처리: 오른쪽 Option: 조합 종료 후 한/A 표시만 *우선 처리*, 실제 처리는 State에서
+            // 별도 처리: 오른쪽 Option: 조합 종료 후 한/A 즉시 전환
             if (type, key) == (.keyDown, .rightOption)
-                && Preferences.rotateShortcuts.contains(.rightOption) {
+                && Preferences.rotateShortcuts.contains(.rightOption)
+                && isSokIMCurrentInputSource() {
                 appDelegate()?.commit()
-                appDelegate()?.statusBar.rotateEngine()
+                appDelegate()?.rotateFromShortcut()
             }
 
-            // 별도 처리: Caps Lock: 한/A 상태 및 LED *우선 처리*, 실제 처리는 State에서
+            // 별도 처리: Caps Lock: 한/A 즉시 전환. LED 쓰기는 백그라운드에서 처리
             if (type, key) == (.keyDown, .capsLock) {
                 if Preferences.rotateShortcuts.contains(.capsLock) {
-                    /* 한/A 전환이 Caps Lock인 경우 800ms 이상 누르고 있으면 활성화 */
-                    let enabled = getKeyboardCapsLock()
+                    if isSokIMCurrentInputSource() {
+                        /* 한/A 전환이 Caps Lock인 경우 800ms 이상 누르고 있으면 활성화 */
+                        let enabled = getKeyboardCapsLock()
 
-                    // Caps Lock 활성 -> 비활성: 한/A 전환 1회 억제
-                    if enabled {
-                        canCapsLockRotate = false
-                    }
-
-                    // Caps Lock 비활성화 및 타이머 초기화
-                    setKeyboardCapsLock(enabled: false)
-                    capsLockTimer.cancel()
-                    capsLockTimer = DispatchWorkItem { [self] in
-                        debug()
-
-                        if modifier[.capsLock] == .keyDown {
-                            // Caps Lock 비활성 -> 활성: 한/A 전환 1회 억제
+                        // Caps Lock 활성 -> 비활성: 한/A 전환 1회 억제
+                        if enabled {
                             canCapsLockRotate = false
-
-                            // Caps Lock 활성화
-                            setKeyboardCapsLock(enabled: true)
-                            appDelegate()?.statusBar.setEngine(QwertyEngine.self) // TODO: #24
                         }
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(800), execute: capsLockTimer)
 
-                    /* 한/A 표시만 *우선 처리* */
-                    if canCapsLockRotate {
-                        appDelegate()?.statusBar.rotateEngine()
+                        // Caps Lock 비활성화 및 타이머 초기화
+                        setKeyboardCapsLock(enabled: false)
+                        capsLockTimer.cancel()
+                        capsLockTimer = DispatchWorkItem { [self] in
+                            debug()
+
+                            if modifier[.capsLock] == .keyDown {
+                                canCapsLockRotate = false
+                                setKeyboardCapsLock(enabled: true)
+                                // 한/A 엔진은 바꾸지 않는다. HID keyUp이 안 오면
+                                // 여기서 영문으로 되돌아가 트레이와 입력이 어긋난다.
+                            }
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(800), execute: capsLockTimer)
+
+                        // 한/A는 CGEvent 탭의 Caps Lock down에서만 전환한다.
+                        // 탭이 없으면 HID keyDown이 물리 누름당 한 번이므로 여기서 전환한다.
+                        if canCapsLockRotate {
+                            if appDelegate()?.hasEventTap() != true {
+                                appDelegate()?.rotateFromShortcut()
+                            }
+                        } else {
+                            canCapsLockRotate = true
+                        }
                     } else {
-                        canCapsLockRotate = true
+                        debug("속 입력기가 아님: Caps Lock 한/A 생략")
                     }
                 }
                 // 그 외의 경우 일반 반전 처리
@@ -249,22 +268,24 @@ class InputMonitor {
             let isShiftDown = modifier[.leftShift] == .keyDown || modifier[.rightShift] == .keyDown
             let isControlDown = modifier[.leftControl] == .keyDown || modifier[.rightControl] == .keyDown
 
-            // 별도 처리: Command/Shift/Control + Space: 한/A 표시만 *우선 처리*, 실제 처리는 State에서 // TODO: #15
-            if (
-                isCommandDown
-                && usage == SpecialUsage.space.rawValue
-                && Preferences.rotateShortcuts.contains(.commandSpace)
-            ) || (
-                isShiftDown
-                && usage == SpecialUsage.space.rawValue
-                && Preferences.rotateShortcuts.contains(.shiftSpace)
-            ) || (
-                isControlDown
-                && usage == SpecialUsage.space.rawValue
-                && Preferences.rotateShortcuts.contains(.controlSpace)
+            // 별도 처리: Command/Shift/Control + Space: 한/A 즉시 전환 // TODO: #15
+            if isSokIMCurrentInputSource() && (
+                (
+                    isCommandDown
+                    && usage == SpecialUsage.space.rawValue
+                    && Preferences.rotateShortcuts.contains(.commandSpace)
+                ) || (
+                    isShiftDown
+                    && usage == SpecialUsage.space.rawValue
+                    && Preferences.rotateShortcuts.contains(.shiftSpace)
+                ) || (
+                    isControlDown
+                    && usage == SpecialUsage.space.rawValue
+                    && Preferences.rotateShortcuts.contains(.controlSpace)
+                )
             ) {
                 appDelegate()?.commit()
-                appDelegate()?.statusBar.rotateEngine()
+                appDelegate()?.rotateFromShortcut()
             }
         }
 

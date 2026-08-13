@@ -2,12 +2,18 @@ import Cocoa
 import InputMethodKit
 import UserNotifications
 
+private(set) var sokAppDelegate: AppDelegate?
+
 func appDelegate() -> AppDelegate? {
-    return NSApp.delegate as? AppDelegate
+    return (NSApp.delegate as? AppDelegate) ?? sokAppDelegate
 }
 
 @main
 class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    override init() {
+        super.init()
+        sokAppDelegate = self
+    }
     // swiftlint:disable force_cast
     private var server: IMKServer = IMKServer.init(
         name: (Bundle.main.infoDictionary!["InputMethodConnectionName"] as! String),
@@ -22,10 +28,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     private var state = State()
     private var sender: IMKTextInput?
+    private(set) var isIMEActive = false
+    var inputEngine: Engine.Type = TwoSetEngine.self {
+        didSet {
+            if oldValue.name != inputEngine.name {
+                statusBar.setEngine(inputEngine)
+                notice("inputEngine \(oldValue.name) → \(inputEngine.name)")
+            }
+        }
+    }
+
+    func setIMEActive(_ active: Bool) {
+        debug("\(active)")
+        isIMEActive = active
+        if !active {
+            resetCapsLockTapDown()
+        }
+    }
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         debug()
 
+        registerSokIMInputSource()
         startCheckingUpdate()
         startMonitorsInitially()
 
@@ -167,44 +191,48 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     private func startMonitorsInitially() {
         debug()
-
-        do {
-            try inputMonitor.start()
-            try clickMonitor.start()
-            try hotKeyMonitor.start()
-            statusBar.setStatus(state.engine.name)
-            statusBar.setError(nil)
-        } catch {
-            warning("\(error)")
-            inputMonitor.stop()
-            clickMonitor.stop()
-            hotKeyMonitor.stop()
-            statusBar.setStatus("⚠️")
-            statusBar.setError("⚠️ \(error)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: startMonitorsInitially)
-        }
+        startMonitors(retryOnError: true)
     }
 
     @objc func restartMonitors(_ aNotification: Notification?) {
         debug("aNotification: \(String(describing: aNotification))")
 
-        do {
-            inputMonitor.stop()
-            try inputMonitor.start()
-            clickMonitor.stop()
-            try clickMonitor.start()
-            hotKeyMonitor.stop()
-            try hotKeyMonitor.start()
-            statusBar.setStatus(state.engine.name)
+        inputMonitor.stop()
+        clickMonitor.stop()
+        hotKeyMonitor.stop()
+        startMonitors(retryOnError: true)
+    }
+
+    func hasEventTap() -> Bool {
+        hotKeyMonitor.isTapEnabled
+    }
+
+    private func startMonitors(retryOnError: Bool) {
+        var errors: [Error] = []
+
+        do { try inputMonitor.start() } catch {
+            warning("inputMonitor: \(error)")
+            errors.append(error)
+        }
+        do { try clickMonitor.start() } catch {
+            warning("clickMonitor: \(error)")
+            errors.append(error)
+        }
+        do { try hotKeyMonitor.start() } catch {
+            warning("hotKeyMonitor: \(error)")
+            errors.append(error)
+        }
+
+        statusBar.setStatus(state.engine.name)
+        if errors.isEmpty {
             statusBar.setError(nil)
-        } catch {
-            warning("\(error)")
-            inputMonitor.stop()
-            clickMonitor.stop()
-            hotKeyMonitor.stop()
-            statusBar.setStatus("⚠️")
-            statusBar.setError("⚠️ \(error)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.restartMonitors(nil) }
+        } else {
+            statusBar.setError("⚠️ \(errors[0])")
+            if retryOnError {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                    self?.startMonitors(retryOnError: true)
+                }
+            }
         }
     }
 
@@ -228,8 +256,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         self.sender = sender
         let strategy = strategy(for: sender)
 
-        // 별도 처리: 암호 필드에 포커스된 경우 OS가 대신 처리
-        if IsSecureEventInputEnabled() {
+        let secure = IsSecureEventInputEnabled()
+        notice("handle secure=\(secure) engine=\(inputEngine.name) key=\(event.keyCode)")
+
+        // 암호 필드는 영문 엔진일 때만 OS에 맡긴다.
+        // Secure Event Input이 새어 있으면 모든 필드가 암호로 보여 한글이 영문으로 빠진다.
+        if secure && inputEngine.name == "A" {
             return false
         }
 
@@ -251,24 +283,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         inputs.forEach { state.next($0) }
         if event.isARepeat, let down = state.down { state.next(down) }
 
+        notice("handle engine=\(state.engine.name) composed='\(state.composed)' composing='\(state.composing)' chars='\(event.characters ?? "")'")
+
+        let hangulStrategy = MarkedStrategy.self
+
         // modifier 없는 백스페이스 키인 경우
         if event.keyCode == kVK_Delete && event.modifierFlags.subtracting(.capsLock).isEmpty {
-            // 조합 중이던 글자에서 백스페이스
             state.backspaceComposing()
-
-            // sender에 백스페이스 반영
-            let handled = strategy.backspace(from: state, to: sender, with: oldState.composing)
-
-            /*
-             처리가 완료된 경우 -> 완성만 버림
-             OS가 대신 처리할 것이 있는 경우 -> 완성/조합 버림
-             */
+            let used = state.engine == state.engines.한 ? hangulStrategy : strategy
+            let handled = used.backspace(from: state, to: sender, with: oldState.composing)
             state.clear(composed: true, composing: !handled)
-
             return handled
         }
 
         let tuple = state.engine.eventToTuple(event)
+
+        // 한글은 항상 marked text로 조합한다. DirectStrategy는 첫 자모를 확정해 ㅎ에서 멈춘다.
+        if state.engine == state.engines.한 {
+            // Enter·화살표 등 매핑 없는 키는 조합을 확정한 뒤 OS에 넘긴다.
+            // 여기서 true를 반환하면 밑줄만 남고 엔터가 먹통이 된다.
+            if tuple == nil {
+                hangulStrategy.commit(from: state, to: sender)
+                state.clear(composed: true, composing: true)
+                notice("handle hangul commit passthrough key=\(event.keyCode)")
+                return false
+            }
+
+            // HID가 이번 키를 반영하지 못했으면 NSEvent로 조합을 이어간다.
+            // composing이 이미 ㅎ인데 여기로 안 넣으면 ㅏ가 붙지 않는다.
+            if state.composed == oldState.composed && state.composing == oldState.composing {
+                state.next(tuple!)
+            }
+            if !state.composed.isEmpty || !state.composing.isEmpty {
+                _ = hangulStrategy.next(from: state, to: sender, with: oldState.composing)
+                state.clear(composed: true, composing: false)
+                notice("handle hangul inserted")
+                return true
+            }
+            notice("handle hangul consumed")
+            return true
+        }
+
         if (
             // event가 engine이 처리할 수 없는 글자인 경우 (예: Cmd + 방향 키 등)
             tuple == nil
@@ -289,12 +344,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             return false
         }
 
-        // event를 engine이 처리할 수 있는데도 state에 완성/조합된 문자열이 없는 경우
         if state.composed.count == 0 && state.composing.count == 0 {
-            // 가능성 1: inputMonitor가 정상적으로 작동하지 않고 있을 수 있으므로 재시작
             inputMonitor.restartIfIdle()
-
-            // 가능성 2: event가 inputs보다 많이 늦어서 직전 handle에서 이미 모두 flush되었을 수 있으므로 완료 반환
             return true
         }
 
@@ -313,6 +364,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         return true
     }
 
+    /** HID 단축키로 한/A를 즉시 전환하고, 이후 handle()의 중복 전환을 막는다 */
+    func rotateFromShortcut() {
+        debug()
+        commit()
+        state.rotateFromShortcut()
+    }
+
+    /** 800ms Caps Lock 홀드 시 영문 엔진으로 고정 */
+    func forceEnglishEngine() {
+        debug()
+
+        state.engine = state.engines.A
+        statusBar.setEngine(state.engines.A)
+    }
+
     /** 지금까지의 입력 전체 state와 sender에 조합 종료 반영 */
     func commit() {
         debug()
@@ -321,7 +387,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         defer { debug("이후 state: \(state)") }
 
         if let sender = sender {
-            strategy(for: sender).commit(from: state, to: sender)
+            if inputEngine.name == "가" {
+                MarkedStrategy.commit(from: state, to: sender)
+            } else {
+                strategy(for: sender).commit(from: state, to: sender)
+            }
             self.sender = nil
         }
         state.clear(composed: true, composing: true)
@@ -400,6 +470,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         setKeyboardCapsLock(enabled: false)
     }
 
+    /** 교체 설치 후 TIS에 속 입력기가 빠지면 handle()이 호출되지 않고 영문만 입력된다 */
+    private func registerSokIMInputSource() {
+        let url = URL(fileURLWithPath: "/Library/Input Methods/SokIM.app") as CFURL
+        let status = TISRegisterInputSource(url)
+        notice("TISRegisterInputSource \(status)")
+
+        guard let list = TISCreateInputSourceList([
+            kTISPropertyBundleID: "com.kiding.inputmethod.sok" as CFString
+        ] as CFDictionary, true)?.takeRetainedValue() as? [TISInputSource] else {
+            warning("속 입력기 TIS 소스 없음")
+            return
+        }
+
+        notice("속 입력기 TIS 소스 \(list.count)개")
+        for source in list {
+            let enable = TISEnableInputSource(source)
+            notice("TISEnableInputSource \(enable)")
+        }
+    }
+
     /** 암호 입력 필드를 위한 ABC 입력기 제한 기능 */
     @objc private func suppressABC(_ aNotification: Notification) {
         debug("\(String(describing: aNotification))")
@@ -423,17 +513,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
 
         guard let sokArray = TISCreateInputSourceList([
-            kTISPropertyInputSourceType: kTISTypeKeyboardInputMode,
-            kTISPropertyInputModeID: "com.kiding.inputmethod.sok.mode" as CFString
-        ] as CFDictionary, false)?.takeRetainedValue() as? [TISInputSource] else {
+            kTISPropertyBundleID: "com.kiding.inputmethod.sok" as CFString
+        ] as CFDictionary, true)?.takeRetainedValue() as? [TISInputSource],
+              let sok = sokArray.first else {
             warning("TISCreateInputSourceList 실패")
             return
         }
-
-        guard let sok = sokArray.first else {
-            warning("sokArray.first 실패")
-            return
-        }
+        _ = TISEnableInputSource(sok)
 
         // "시스템 설정 > 암호" 필드에서는 무한 루프에 빠질 수 있음
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) {
@@ -450,11 +536,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         debug("\(String(describing: aNotification))")
 
         guard IsSecureEventInputEnabled() else { return }
-
-        clearExceptEngine(nil)
-        state.engine = state.engines.A
-        statusBar.setEngine(state.engines.A)
-
-        debug("abcOnSecureInput 성공")
+        notice("abcOnSecureInput: secure 입력이지만 한/A 엔진은 유지")
     }
 }

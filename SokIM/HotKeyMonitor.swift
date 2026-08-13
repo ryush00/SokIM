@@ -1,6 +1,13 @@
 import QuartzCore
 import Carbon.HIToolbox
 
+/** CGEvent 탭 콜백은 self를 못 쓰므로, Caps Lock down/up 쌍을 여기 둔다. */
+private var capsLockTapDown = false
+
+func resetCapsLockTapDown() {
+    capsLockTapDown = false
+}
+
 enum HotKeyMonitorError: Error, CustomStringConvertible {
     case axProcessNotTrusted
     case failedToCreateTap
@@ -35,6 +42,11 @@ class HotKeyMonitor {
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
 
+    var isTapEnabled: Bool {
+        guard let tap else { return false }
+        return CGEvent.tapIsEnabled(tap: tap)
+    }
+
     private var eventHandlerRef: EventHandlerRef?
     private var eventHotKeyRefs: [EventHotKeyRef] = []
 
@@ -59,11 +71,31 @@ class HotKeyMonitor {
             options: .defaultTap,
             eventsOfInterest: CGEventMask(
                 1 << CGEventType.keyDown.rawValue
+                | 1 << CGEventType.flagsChanged.rawValue
             ),
             callback: { _, type, event, _ in
                 debug("\(type) \(event.flags)")
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                     appDelegate()?.restartMonitors(nil)
+                    return Unmanaged.passUnretained(event)
+                }
+
+                let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+                if Preferences.rotateShortcuts.contains(.capsLock)
+                    && keycode == Int64(kVK_CapsLock)
+                    && isSokIMCurrentInputSource() {
+                    // Caps Lock down/up이 쌍으로 온다. 한/A는 down에서만 전환하고, OS 대소문자는 흡수한다.
+                    if !capsLockTapDown {
+                        capsLockTapDown = true
+                        notice("Caps Lock down → 한/A")
+                        appDelegate()?.rotateFromShortcut()
+                    } else {
+                        capsLockTapDown = false
+                        notice("Caps Lock up")
+                        appDelegate()?.inputMonitor.cancelCapsLockHoldTimer()
+                    }
+                    setKeyboardCapsLock(enabled: false)
+                    return nil
                 }
 
                 let flags = Int32(event.flags.rawValue)

@@ -130,8 +130,10 @@ extension Engine {
         let isOptionDown = flags.contains(.option)
         let isShiftDown = flags.contains(.shift)
 
-        // Caps Lock: 활성화 상태
-        let isCapsLockOn = flags.contains(.capsLock)
+        // Caps Lock을 한/A 키로 쓰는 동안 OS Caps Lock 플래그는 무시한다
+        let isCapsLockOn = Preferences.rotateShortcuts.contains(.capsLock)
+            ? false
+            : flags.contains(.capsLock)
 
         if let usage = keyCodeToUsage[Int(keyCode)],
            let tuple = usageToTuple(usage, isOptionDown, isShiftDown, isCapsLockOn) {

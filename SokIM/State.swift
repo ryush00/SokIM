@@ -18,6 +18,9 @@ struct State: CustomStringConvertible {
     /** 한/A 전환이 Caps Lock인 경우 Caps Lock이 활성화/비활성화 되는 과정에서 한/A 전환이 진행될 수 있는지 여부를 판단하는 플래그 (InputMonitor와 유사) */
     private var canCapsLockRotate = true
 
+    /** InputMonitor가 이미 한/A 전환을 반영한 경우 handle()의 중복 rotate를 건너뛴다 */
+    private var skipNextRotate = false
+
     /** 마지막으로 keyDown이었던 Caps Lock Input */
     private var lastCapsLockDownInput: Input?
 
@@ -34,58 +37,24 @@ struct State: CustomStringConvertible {
         if let key = ModifierUsage(rawValue: usage) {
             modifier[key] = type
 
-            // 오른쪽 Command: 한/A 전환 *실제 처리*
-            if (type, key) == (.keyDown, .rightCommand)
-                && Preferences.rotateShortcuts.contains(.rightCommand) {
-                rotate()
-            }
-
-            // 오른쪽 Option: 한/A 전환 *실제 처리*
-            if (type, key) == (.keyDown, .rightOption)
-                && Preferences.rotateShortcuts.contains(.rightOption) {
-                rotate()
-            }
-
-            // Caps Lock: 한/A 상태 및 LED *실제 처리*
+            // 한/A 전환은 단축키 경로(탭/HID)에서만 한다.
+            // 여기서 다시 rotate하면 다음 글자의 handle()이 Caps Lock keyDown을
+            // 한 번 더 보고 한글에서 영문으로 되돌린다.
             if (type, key) == (.keyDown, .capsLock) {
-                // 한/A 전환이 Caps Lock인 경우 처리
                 if Preferences.rotateShortcuts.contains(.capsLock) {
-                    // Caps Lock 활성 -> 비활성: 한/A 전환 1회 억제
-                    if isCapsLockOn {
-                        canCapsLockRotate = false
-                    }
-
-                    // Caps Lock 비활성화
                     isCapsLockOn = false
                     lastCapsLockDownInput = input
-
-                    // 한/A 전환
-                    if canCapsLockRotate {
-                        rotate()
-                    } else {
-                        canCapsLockRotate = true
-                    }
-                }
-                // 그 외의 경우 일반 반전 처리
-                else {
+                    skipNextRotate = false
+                } else {
                     isCapsLockOn.toggle()
                 }
             }
 
-            // Caps Lock: Caps Lock *실제 처리*
+            // Caps Lock keyUp: 800ms 홀드는 InputMonitor 타이머가 StatusBar와 함께 처리한다.
+            // HID timestamp로 여기서 engine만 A로 바꾸면 트레이와 입력이 어긋난다.
             if (type, key) == (.keyUp, .capsLock)
                 && Preferences.rotateShortcuts.contains(.capsLock) {
-                // 마지막으로 keyDown된 Caps Lock Input의 timestamp가 800ms 이상 차이 나면 Caps Lock 활성화
-                if let down = lastCapsLockDownInput,
-                    ms(absolute: input.timestamp) - ms(absolute: down.timestamp) > 800 {
-                    // Caps Lock 비활성 -> 활성: 한/A 전환 1회 억제
-                    canCapsLockRotate = false
-
-                    // Caps Lock 활성화
-                    isCapsLockOn = true
-                    lastCapsLockDownInput = nil
-                    engine = engines.A
-                }
+                lastCapsLockDownInput = nil
             }
         }
         // 그 외 경우 중 keyDown인 경우
@@ -113,8 +82,11 @@ struct State: CustomStringConvertible {
                 && usage == SpecialUsage.space.rawValue
                 && Preferences.rotateShortcuts.contains(.controlSpace)
             ) {
-                rotate()
-
+                if skipNextRotate {
+                    skipNextRotate = false
+                } else {
+                    rotate()
+                }
                 return
             }
 
@@ -155,17 +127,40 @@ struct State: CustomStringConvertible {
 
     // MARK: - KeyboardEngine
 
-    var engine: Engine.Type = TwoSetEngine.self
+    var engine: Engine.Type {
+        get { appDelegate()?.inputEngine ?? TwoSetEngine.self }
+        set {
+            if appDelegate()?.inputEngine.name != newValue.name {
+                appDelegate()?.inputEngine = newValue
+            }
+        }
+    }
+
     init(engine: Engine.Type) {
         debug("\(engine)")
-
         self.engine = engine
     }
     let engines = (한: TwoSetEngine.self, A: QwertyEngine.self) // TODO: #24
 
+    /** HID 단축키에서 즉시 전환하고, 이어지는 handle()의 rotate()는 건너뛴다 */
+    mutating func rotateFromShortcut() {
+        debug()
+
+        engine = engine == engines.한 ? engines.A : engines.한
+        skipNextRotate = true
+        appDelegate()?.statusBar.setEngine(engine)
+    }
+
     /** 사용 가능한 다음 engine으로 변경 */
     mutating func rotate() {
         debug()
+
+        if skipNextRotate {
+            skipNextRotate = false
+            debug("단축키 전환이 이미 반영됨")
+            appDelegate()?.statusBar.setEngine(engine)
+            return
+        }
 
         engine = engine == engines.한 ? engines.A : engines.한
 
