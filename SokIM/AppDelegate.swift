@@ -38,6 +38,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var mouseStuckSamples = 0
     private var cursorWatch: Timer?
     private var recoverWork: DispatchWorkItem?
+    private var postingReturnKey = false
     var inputEngine: Engine.Type = TwoSetEngine.self {
         didSet {
             if oldValue.name != inputEngine.name {
@@ -445,8 +446,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // 한글은 항상 marked text로 조합한다. DirectStrategy는 첫 자모를 확정해 ㅎ에서 멈춘다.
         if state.engine == state.engines.한 {
-            // Enter·화살표 등 매핑 없는 키는 조합을 확정한 뒤 OS에 넘긴다.
-            // 여기서 true를 반환하면 밑줄만 남고 엔터가 먹통이 된다.
+            // Enter는 조합을 확정한다. false를 그대로 주면 텔레그램은 줄바꿈을 넣고,
+            // true만 주면 전송에 한 번 더 엔터가 필요하다. 확정 뒤에 표시 없는 엔터를 다시 보낸다.
+            if event.keyCode == kVK_Return || event.keyCode == kVK_ANSI_KeypadEnter {
+                if postingReturnKey {
+                    notice("handle hangul synthetic enter passthrough")
+                    return false
+                }
+                let hadComposition = !oldState.composed.isEmpty || !oldState.composing.isEmpty
+                let shift = event.modifierFlags.contains(.shift)
+                state = oldState
+                MarkedStrategy.commit(from: state, to: sender)
+                state.clear(composed: true, composing: true)
+                if hadComposition && !shift && !clientUsesRawMarkedText {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.postReturnKeyToFocusedApp(event.keyCode)
+                    }
+                    notice("handle hangul commit enter replay")
+                    return true
+                }
+                notice("handle hangul commit enter consumed=\(hadComposition) shift=\(shift)")
+                return hadComposition && !shift
+            }
+
+            // 화살표 등 매핑 없는 키는 조합을 확정한 뒤 OS에 넘긴다.
             if tuple == nil {
                 MarkedStrategy.commit(from: state, to: sender)
                 state.clear(composed: true, composing: true)
@@ -537,6 +560,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             return
         }
         selectSokIMHangulFromShortcut()
+    }
+
+    /** 조합을 끝낸 엔터를 포커스 앱에 다시 보내 전송이 한 번에 되게 한다. */
+    private func postReturnKeyToFocusedApp(_ keyCode: UInt16) {
+        postingReturnKey = true
+        let source = CGEventSource(stateID: .hidSystemState)
+        let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true)
+        let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
+        down?.post(tap: .cgSessionEventTap)
+        up?.post(tap: .cgSessionEventTap)
+        DispatchQueue.main.async { [weak self] in
+            self?.postingReturnKey = false
+        }
+        notice("postReturnKey \(keyCode)")
     }
 
     /** 채팅 키 이름 없이, ABC에 남은 뒤 첫 키에서 속을 되돌린다. */
