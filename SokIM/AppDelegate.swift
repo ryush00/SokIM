@@ -29,6 +29,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var state = State()
     private var sender: IMKTextInput?
     private(set) var isIMEActive = false
+    private(set) var isIMESettling = false
+    private var imeSettleWork: DispatchWorkItem?
+    private var needsMarkedTextPrime = false
+    private var clientUsesRawMarkedText = false
+    private var lastInputSourceID = ""
     var inputEngine: Engine.Type = TwoSetEngine.self {
         didSet {
             if oldValue.name != inputEngine.name {
@@ -38,12 +43,79 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    func setIMEActive(_ active: Bool) {
-        debug("\(active)")
-        isIMEActive = active
-        if !active {
-            resetCapsLockTapDown()
+    func rememberClient(_ sender: IMKTextInput) {
+        let attrs = sender.validAttributesForMarkedText() as? [String] ?? []
+        clientUsesRawMarkedText = attrs.isEmpty
+    }
+
+    /** GLFW처럼 marked text 속성이 없으면 IME on/off 기본 확정을 하지 않는다 */
+    func shouldDeferIMECommit(client: Any? = nil) -> Bool {
+        if let input = client as? IMKTextInput {
+            rememberClient(input)
         }
+        return clientUsesRawMarkedText
+    }
+
+    func shouldSkipCommitComposition() -> Bool {
+        clientUsesRawMarkedText && isIMESettling
+    }
+
+    func setIMEActive(_ active: Bool, client: Any? = nil) {
+        debug("\(active)")
+        if let input = client as? IMKTextInput {
+            sender = input
+            rememberClient(input)
+        }
+
+        if active {
+            imeSettleWork?.cancel()
+            imeSettleWork = nil
+            isIMESettling = false
+            isIMEActive = true
+            if clientUsesRawMarkedText {
+                needsMarkedTextPrime = true
+                if let sender {
+                    primeMarkedText(sender)
+                }
+            } else {
+                needsMarkedTextPrime = false
+            }
+        } else {
+            isIMEActive = false
+            resetCapsLockTapDown()
+            if clientUsesRawMarkedText {
+                scheduleIMESettle()
+            } else {
+                isIMESettling = false
+            }
+        }
+    }
+
+    /** marked text 세션이 없는 클라이언트에 빈 조합을 한 번 넣어 첫 글자가 확정되지 않게 한다 */
+    func primeMarkedText(_ sender: IMKTextInput) {
+        let empty = NSAttributedString(string: "")
+        sender.setMarkedText(empty, selectionRange: NSRange(location: 0, length: 0), replacementRange: defaultRange)
+        needsMarkedTextPrime = false
+        notice("primeMarkedText attrsEmpty=\(clientUsesRawMarkedText)")
+    }
+
+    /** 채팅 오픈 직후 TIS/IME 깜빡임이 잦아든 뒤에만 조합을 버린다 */
+    private func scheduleIMESettle() {
+        isIMESettling = true
+        imeSettleWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.isIMESettling = false
+            self.imeSettleWork = nil
+            if self.isIMEActive || isSokIMCurrentInputSource() {
+                notice("IME settle keep composing")
+                return
+            }
+            notice("IME settle commit")
+            self.commit()
+        }
+        imeSettleWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(300), execute: work)
     }
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
@@ -65,6 +137,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(suppressABC),
+            name: NSTextInputContext.keyboardSelectionDidChangeNotification,
+            object: nil
+        )
+
+        // GLFW IME on이 애플 두벌식을 고르면 속으로 되돌린다. ABC(IME off)는 건드리지 않는다.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(claimKoreanIMEIfNeeded),
             name: NSTextInputContext.keyboardSelectionDidChangeNotification,
             object: nil
         )
@@ -254,6 +334,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             return false
         }
         self.sender = sender
+        rememberClient(sender)
+        if needsMarkedTextPrime && clientUsesRawMarkedText {
+            primeMarkedText(sender)
+        }
         let strategy = strategy(for: sender)
 
         let secure = IsSecureEventInputEnabled()
@@ -285,12 +369,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         notice("handle engine=\(state.engine.name) composed='\(state.composed)' composing='\(state.composing)' chars='\(event.characters ?? "")'")
 
-        let hangulStrategy = MarkedStrategy.self
+        notice("hangulStrategy=MarkedStrategy bundle=\(sender.bundleIdentifier() ?? "")")
 
         // modifier 없는 백스페이스 키인 경우
         if event.keyCode == kVK_Delete && event.modifierFlags.subtracting(.capsLock).isEmpty {
             state.backspaceComposing()
-            let used = state.engine == state.engines.한 ? hangulStrategy : strategy
+            let used = state.engine == state.engines.한 ? MarkedStrategy.self : strategy
             let handled = used.backspace(from: state, to: sender, with: oldState.composing)
             state.clear(composed: true, composing: !handled)
             return handled
@@ -303,7 +387,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             // Enter·화살표 등 매핑 없는 키는 조합을 확정한 뒤 OS에 넘긴다.
             // 여기서 true를 반환하면 밑줄만 남고 엔터가 먹통이 된다.
             if tuple == nil {
-                hangulStrategy.commit(from: state, to: sender)
+                MarkedStrategy.commit(from: state, to: sender)
                 state.clear(composed: true, composing: true)
                 notice("handle hangul commit passthrough key=\(event.keyCode)")
                 return false
@@ -315,7 +399,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 state.next(tuple!)
             }
             if !state.composed.isEmpty || !state.composing.isEmpty {
-                _ = hangulStrategy.next(from: state, to: sender, with: oldState.composing)
+                _ = MarkedStrategy.next(from: state, to: sender, with: oldState.composing)
                 state.clear(composed: true, composing: false)
                 notice("handle hangul inserted")
                 return true
@@ -463,6 +547,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     @objc func clearExceptEngine(_ aNotification: Notification?) {
         debug("\(String(describing: aNotification))")
 
+        if isSokIMCurrentInputSource() || isIMEActive || (clientUsesRawMarkedText && isIMESettling) {
+            notice("clearExceptEngine skipped")
+            return
+        }
+
+        if clientUsesRawMarkedText {
+            scheduleIMESettle()
+            return
+        }
+
+        commit()
         inputMonitor.flush()
         state = State(engine: state.engine)
         sender = nil
@@ -488,6 +583,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             let enable = TISEnableInputSource(source)
             notice("TISEnableInputSource \(enable)")
         }
+    }
+
+    /** ASCII 키보드에서 애플 한글 IME로 바뀌면 앱이 한국어 IME를 켠 것이다. 속을 고른다. */
+    @objc private func claimKoreanIMEIfNeeded(_ aNotification: Notification) {
+        guard let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              let idOpaque = TISGetInputSourceProperty(current, kTISPropertyInputSourceID)
+        else { return }
+        let currentID = Unmanaged<CFString>.fromOpaque(idOpaque).takeUnretainedValue() as String
+        let previousID = lastInputSourceID
+        lastInputSourceID = currentID
+
+        let fromASCII = previousID.contains("keylayout")
+        let toAppleKorean = currentID.contains("com.apple.inputmethod.Korean")
+        guard fromASCII && toAppleKorean else { return }
+
+        guard let sokArray = TISCreateInputSourceList([
+            kTISPropertyBundleID: "com.kiding.inputmethod.sok" as CFString
+        ] as CFDictionary, true)?.takeRetainedValue() as? [TISInputSource],
+              let sok = sokArray.first else { return }
+
+        let status = TISSelectInputSource(sok)
+        notice("claimKoreanIME \(previousID) → \(currentID) → sok \(status)")
     }
 
     /** 암호 입력 필드를 위한 ABC 입력기 제한 기능 */
