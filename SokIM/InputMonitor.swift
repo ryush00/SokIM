@@ -252,7 +252,8 @@ class InputMonitor {
                             canCapsLockRotate = true
                         }
                     } else {
-                        debug("속 입력기가 아님: Caps Lock 한/A 생략")
+                        debug("속 입력기가 아님: Caps Lock 한/A 생략, 물리 Caps Lock은 끈다")
+                        setKeyboardCapsLock(enabled: false)
                     }
                 }
                 // 그 외의 경우 일반 반전 처리

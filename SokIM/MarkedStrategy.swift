@@ -1,13 +1,16 @@
 import InputMethodKit
 
 struct MarkedStrategy: Strategy {
+    private static func markedString(_ text: String) -> NSAttributedString {
+        NSAttributedString(string: text, attributes: [.backgroundColor: NSColor.clear])
+    }
+
     static func backspace(from state: State, to sender: IMKTextInput, with composing: String) -> Bool {
         debug("\(composing) -> \(state)")
 
         // composing이 변경된 경우
         if composing != state.composing {
-            let string = NSAttributedString(string: state.composing, attributes: [.backgroundColor: NSColor.clear])
-            sender.setMarkedText(string, selectionRange: defaultRange, replacementRange: defaultRange)
+            sender.setMarkedText(markedString(state.composing), selectionRange: defaultRange, replacementRange: defaultRange)
 
             // OS가 추가 처리 하지 않음
             return true
@@ -28,8 +31,12 @@ struct MarkedStrategy: Strategy {
              */
             let selectedRange = sender.selectedRange()
             if 0 < selectedRange.length && selectedRange.length < NSNotFound {
-                let string = NSAttributedString(string: state.composed, attributes: [.backgroundColor: NSColor.clear])
-                sender.setMarkedText(string, selectionRange: defaultRange, replacementRange: selectedRange)
+                sender.setMarkedText(markedString(state.composed), selectionRange: defaultRange, replacementRange: selectedRange)
+            }
+
+            // GLFW는 조합 중인 NFD preedit를 insertText로 커밋한다. 먼저 비운다.
+            if usesRawMarkedText(sender) {
+                sender.setMarkedText(NSAttributedString(string: ""), selectionRange: NSRange(location: 0, length: 0), replacementRange: defaultRange)
             }
 
             sender.insertText(state.composed, replacementRange: defaultRange)
@@ -37,8 +44,7 @@ struct MarkedStrategy: Strategy {
 
         // composing -> setMarkedText
         if state.composing.count > 0 {
-            let string = NSAttributedString(string: state.composing, attributes: [.backgroundColor: NSColor.clear])
-            sender.setMarkedText(string, selectionRange: defaultRange, replacementRange: defaultRange)
+            sender.setMarkedText(markedString(state.composing), selectionRange: defaultRange, replacementRange: defaultRange)
         }
 
         return true
@@ -46,6 +52,10 @@ struct MarkedStrategy: Strategy {
 
     static func commit(from state: State, to sender: IMKTextInput) {
         debug("\(state)")
+
+        if usesRawMarkedText(sender) && (!state.composed.isEmpty || !state.composing.isEmpty) {
+            sender.setMarkedText(NSAttributedString(string: ""), selectionRange: NSRange(location: 0, length: 0), replacementRange: defaultRange)
+        }
 
         // composed -> insertText
         if state.composed.count > 0 {

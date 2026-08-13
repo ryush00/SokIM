@@ -34,6 +34,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var needsMarkedTextPrime = false
     private var clientUsesRawMarkedText = false
     private var lastInputSourceID = ""
+    private var lastMouseLocation = NSEvent.mouseLocation
+    private var mouseStuckSamples = 0
+    private var cursorWatch: Timer?
+    private var recoverWork: DispatchWorkItem?
     var inputEngine: Engine.Type = TwoSetEngine.self {
         didSet {
             if oldValue.name != inputEngine.name {
@@ -44,8 +48,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func rememberClient(_ sender: IMKTextInput) {
-        let attrs = sender.validAttributesForMarkedText() as? [String] ?? []
-        clientUsesRawMarkedText = attrs.isEmpty
+        let attrs = markedTextAttributes(for: sender)
+        let raw = usesRawMarkedText(sender)
+        if raw != clientUsesRawMarkedText {
+            notice("rememberClient raw=\(raw) attrs=\(attrs) bundle=\(sender.bundleIdentifier() ?? "")")
+        }
+        clientUsesRawMarkedText = raw
     }
 
     /** GLFW처럼 marked text 속성이 없으면 IME on/off 기본 확정을 하지 않는다 */
@@ -73,9 +81,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             isIMESettling = false
             isIMEActive = true
             if clientUsesRawMarkedText {
-                needsMarkedTextPrime = true
-                if let sender {
-                    primeMarkedText(sender)
+                // GLFW 채팅은 속의 영문 엔진(A)이나 ABC에 머물면 라틴만 넣는다.
+                // 트레이에 속이 보여도 게임은 영어 IME 경로를 탄다.
+                if inputEngine.name != state.engines.한.name {
+                    state.engine = state.engines.한
+                    statusBar.setEngine(state.engines.한)
+                    notice("raw client activate → 한글")
+                }
+                _ = selectSokIMInputSource()
+                if state.composed.isEmpty && state.composing.isEmpty {
+                    needsMarkedTextPrime = true
+                    if let sender {
+                        primeMarkedText(sender)
+                    }
+                } else {
+                    needsMarkedTextPrime = false
+                    notice("skip prime while composing")
                 }
             } else {
                 needsMarkedTextPrime = false
@@ -83,6 +104,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         } else {
             isIMEActive = false
             resetCapsLockTapDown()
+            if Preferences.rotateShortcuts.contains(.capsLock) {
+                setKeyboardCapsLock(enabled: false)
+            }
             if clientUsesRawMarkedText {
                 scheduleIMESettle()
             } else {
@@ -93,10 +117,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     /** marked text 세션이 없는 클라이언트에 빈 조합을 한 번 넣어 첫 글자가 확정되지 않게 한다 */
     func primeMarkedText(_ sender: IMKTextInput) {
+        guard state.composed.isEmpty && state.composing.isEmpty else {
+            needsMarkedTextPrime = false
+            return
+        }
         let empty = NSAttributedString(string: "")
         sender.setMarkedText(empty, selectionRange: NSRange(location: 0, length: 0), replacementRange: defaultRange)
         needsMarkedTextPrime = false
         notice("primeMarkedText attrsEmpty=\(clientUsesRawMarkedText)")
+    }
+
+    /** TIS 깜빡임으로 조합 중인 글자를 insertText하면 ㅎㅏㄴ으로 풀린다. 로컬 상태만 버린다. */
+    private func dropComposingWithoutInsert() {
+        notice("drop composing without insert '\(state.composing)'")
+        sender = nil
+        state.clear(composed: true, composing: true)
+        inputMonitor.flush()
+        InputContext.commit()
     }
 
     /** 채팅 오픈 직후 TIS/IME 깜빡임이 잦아든 뒤에만 조합을 버린다 */
@@ -111,19 +148,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 notice("IME settle keep composing")
                 return
             }
+            if self.clientUsesRawMarkedText {
+                // 조합을 버리면 다음 키가 ㅏ/ㄴ부터 새로 시작해 ㅎㅏㄴ이 된다.
+                notice("IME settle keep composing for raw client")
+                return
+            }
             notice("IME settle commit")
             self.commit()
         }
         imeSettleWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(300), execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(800), execute: work)
     }
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         debug()
 
         registerSokIMInputSource()
+        if Preferences.rotateShortcuts.contains(.capsLock) {
+            setKeyboardCapsLock(enabled: false)
+        }
         startCheckingUpdate()
         startMonitorsInitially()
+        startCursorWatch()
 
         // 사용자가 입력기를 변경하는 시점에 대부분 버림
         NotificationCenter.default.addObserver(
@@ -142,6 +188,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         )
 
         // GLFW IME on이 애플 두벌식을 고르면 속으로 되돌린다. ABC(IME off)는 건드리지 않는다.
+        // Caps Lock 한/A는 ABC에서도 속을 직접 고른다.
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(claimKoreanIMEIfNeeded),
@@ -369,7 +416,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         notice("handle engine=\(state.engine.name) composed='\(state.composed)' composing='\(state.composing)' chars='\(event.characters ?? "")'")
 
-        notice("hangulStrategy=MarkedStrategy bundle=\(sender.bundleIdentifier() ?? "")")
+        notice("hangulStrategy=MarkedStrategy bundle=\(sender.bundleIdentifier() ?? "") raw=\(clientUsesRawMarkedText) attrs=\(markedTextAttributes(for: sender))")
 
         // modifier 없는 백스페이스 키인 경우
         if event.keyCode == kVK_Delete && event.modifierFlags.subtracting(.capsLock).isEmpty {
@@ -382,6 +429,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         let tuple = state.engine.eventToTuple(event)
 
+        // 영문 엔진인데 NSEvent에 한글 자모가 실리면 OS로 넘기지 않는다.
+        // IME on/off 직후 event.characters가 ㄹ인데 composed는 f인 경우가 있다.
+        if state.engine == state.engines.A && containsHangul(event.characters) {
+            if state.composed == oldState.composed && state.composing == oldState.composing, let tuple {
+                state.next(tuple)
+            }
+            if !state.composed.isEmpty || !state.composing.isEmpty {
+                _ = strategy.next(from: state, to: sender, with: oldState.composing)
+                state.clear(composed: true, composing: false)
+            }
+            notice("handle latin despite hangul chars")
+            return true
+        }
+
         // 한글은 항상 marked text로 조합한다. DirectStrategy는 첫 자모를 확정해 ㅎ에서 멈춘다.
         if state.engine == state.engines.한 {
             // Enter·화살표 등 매핑 없는 키는 조합을 확정한 뒤 OS에 넘긴다.
@@ -393,11 +454,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 return false
             }
 
-            // HID가 이번 키를 반영하지 못했으면 NSEvent로 조합을 이어간다.
-            // composing이 이미 ㅎ인데 여기로 안 넣으면 ㅏ가 붙지 않는다.
-            if state.composed == oldState.composed && state.composing == oldState.composing {
-                state.next(tuple!)
-            }
+            // HID 큐에 이전 글쇠가 남아 있으면 ㅎ 다음에 ㅏ가 붙지 않고
+            // ㅎ/ㅏ/ㄴ이 각각 새 조합으로 시작된다. 이번 NSEvent만 적용한다.
+            state = oldState
+            state.next(tuple!)
             if !state.composed.isEmpty || !state.composing.isEmpty {
                 _ = MarkedStrategy.next(from: state, to: sender, with: oldState.composing)
                 state.clear(composed: true, composing: false)
@@ -406,6 +466,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             }
             notice("handle hangul consumed")
             return true
+        }
+
+        if state.composed == oldState.composed && state.composing == oldState.composing, let tuple {
+            state.next(tuple)
         }
 
         if (
@@ -453,6 +517,84 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         debug()
         commit()
         state.rotateFromShortcut()
+    }
+
+    /** ABC 등 다른 소스에서 Caps Lock 한/A를 누르면 속을 한글 엔진으로 고른다. */
+    func selectSokIMHangulFromShortcut() {
+        debug()
+        commit()
+        state.engine = state.engines.한
+        statusBar.setEngine(state.engines.한)
+        let status = selectSokIMInputSource()
+        notice("selectSokIMHangulFromShortcut \(status) now=\(currentInputSourceIDs().joined(separator: ", "))")
+        setKeyboardCapsLock(enabled: false)
+    }
+
+    /** GLFW 채팅처럼 marked text가 빈약한 클라이언트가 열려 있으면 속을 한글로 되돌린다. */
+    func recoverRawKoreanIMEIfNeeded() {
+        guard clientUsesRawMarkedText else { return }
+        if isSokIMCurrentInputSource() && inputEngine.name == state.engines.한.name {
+            return
+        }
+        selectSokIMHangulFromShortcut()
+    }
+
+    /** 채팅 키 이름 없이, ABC에 남은 뒤 첫 키에서 속을 되돌린다. */
+    func scheduleRawKoreanIMERecover() {
+        guard looksLikeFrontmostRawGame() else { return }
+        guard recoverWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.recoverWork = nil
+            guard self.looksLikeFrontmostRawGame() else { return }
+            if isSokIMCurrentInputSource() && self.inputEngine.name == self.state.engines.한.name {
+                return
+            }
+            notice("key while ABC → 속 한글")
+            self.selectSokIMHangulFromShortcut()
+        }
+        recoverWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50), execute: work)
+    }
+
+    /**
+     GLFW 게임은 플레이 중 커서를 화면 중심에 잠그고, 채팅에서 다시 움직이게 한다.
+     T·/ 키 이름 없이, 잠김→이동 전환만으로 속을 한글에 붙인다.
+     */
+    private func startCursorWatch() {
+        lastMouseLocation = NSEvent.mouseLocation
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            self?.checkCursorForRawKoreanIME()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        cursorWatch = timer
+    }
+
+    private func checkCursorForRawKoreanIME() {
+        let now = NSEvent.mouseLocation
+        let distance = hypot(now.x - lastMouseLocation.x, now.y - lastMouseLocation.y)
+        lastMouseLocation = now
+        if distance <= 2 {
+            mouseStuckSamples = min(mouseStuckSamples + 1, 40)
+            return
+        }
+        let wasLocked = mouseStuckSamples >= 8
+        mouseStuckSamples = 0
+        guard wasLocked else { return }
+        guard looksLikeFrontmostRawGame() else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80)) { [weak self] in
+            guard let self else { return }
+            if isSokIMCurrentInputSource() {
+                if self.inputEngine.name != self.state.engines.한.name {
+                    self.state.engine = self.state.engines.한
+                    self.statusBar.setEngine(self.state.engines.한)
+                    notice("cursor unlocked → 한글 엔진")
+                }
+                return
+            }
+            notice("cursor unlocked → 속 한글")
+            self.selectSokIMHangulFromShortcut()
+        }
     }
 
     /** 800ms Caps Lock 홀드 시 영문 엔진으로 고정 */
@@ -583,6 +725,62 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             let enable = TISEnableInputSource(source)
             notice("TISEnableInputSource \(enable)")
         }
+        persistSokIMEnabledSource()
+    }
+
+    /** 선택 가능한 속 모드를 고른다. 메서드 본체는 selectCapable가 아니다. */
+    private func sokIMSelectableSource() -> TISInputSource? {
+        guard let list = TISCreateInputSourceList([
+            kTISPropertyBundleID: "com.kiding.inputmethod.sok" as CFString
+        ] as CFDictionary, true)?.takeRetainedValue() as? [TISInputSource] else {
+            return nil
+        }
+        for source in list {
+            guard let typeOpaque = TISGetInputSourceProperty(source, kTISPropertyInputSourceType) else {
+                continue
+            }
+            let type = Unmanaged<CFString>.fromOpaque(typeOpaque).takeUnretainedValue() as String
+            if type == (kTISTypeKeyboardInputMode as String) {
+                return source
+            }
+        }
+        return list.first
+    }
+
+    @discardableResult
+    private func selectSokIMInputSource() -> OSStatus {
+        guard let sok = sokIMSelectableSource() else {
+            warning("속 입력기 선택 소스 없음")
+            return OSStatus(paramErr)
+        }
+        return TISSelectInputSource(sok)
+    }
+
+    /** GLFW TISCopyInputSourceForLanguage(ko)가 속을 찾도록 서드파티 활성 목록에 남긴다. */
+    private func persistSokIMEnabledSource() {
+        let entry: [String: Any] = [
+            "Bundle ID": "com.kiding.inputmethod.sok",
+            "Input Mode": "com.kiding.inputmethod.sok.mode",
+            "InputSourceKind": "Input Mode"
+        ]
+        let key = "AppleEnabledThirdPartyInputSources" as CFString
+        let app = "com.apple.HIToolbox" as CFString
+        let existing = (CFPreferencesCopyAppValue(key, app) as? [[String: Any]]) ?? []
+        if existing.contains(where: { $0["Bundle ID"] as? String == "com.kiding.inputmethod.sok" }) {
+            return
+        }
+        var next = existing
+        next.append(entry)
+        CFPreferencesSetAppValue(key, next as CFArray, app)
+        CFPreferencesAppSynchronize(app)
+        notice("AppleEnabledThirdPartyInputSources에 속 추가")
+    }
+
+    private func looksLikeFrontmostRawGame() -> Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return false }
+        let bundle = app.bundleIdentifier ?? ""
+        let name = (app.localizedName ?? "").lowercased()
+        return bundle.isEmpty || bundle.contains("minecraft") || name.contains("java")
     }
 
     /** ASCII 키보드에서 애플 한글 IME로 바뀌면 앱이 한국어 IME를 켠 것이다. 속을 고른다. */
@@ -594,17 +792,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let previousID = lastInputSourceID
         lastInputSourceID = currentID
 
-        let fromASCII = previousID.contains("keylayout")
-        let toAppleKorean = currentID.contains("com.apple.inputmethod.Korean")
-        guard fromASCII && toAppleKorean else { return }
+        let appleKorean = currentID.contains("com.apple.inputmethod.Korean")
+        let stolenToABC = currentID.contains("keylayout")
+            && looksLikeFrontmostRawGame()
+            && mouseStuckSamples < 8
+        guard appleKorean || stolenToABC else { return }
 
-        guard let sokArray = TISCreateInputSourceList([
-            kTISPropertyBundleID: "com.kiding.inputmethod.sok" as CFString
-        ] as CFDictionary, true)?.takeRetainedValue() as? [TISInputSource],
-              let sok = sokArray.first else { return }
-
-        let status = TISSelectInputSource(sok)
+        imeSettleWork?.cancel()
+        isIMESettling = false
+        needsMarkedTextPrime = true
+        if stolenToABC {
+            state.engine = state.engines.한
+            statusBar.setEngine(state.engines.한)
+        }
+        let status = selectSokIMInputSource()
         notice("claimKoreanIME \(previousID) → \(currentID) → sok \(status)")
+        if let sender, clientUsesRawMarkedText {
+            primeMarkedText(sender)
+        }
     }
 
     /** 암호 입력 필드를 위한 ABC 입력기 제한 기능 */

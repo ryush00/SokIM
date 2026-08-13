@@ -3,9 +3,26 @@ import Carbon.HIToolbox
 
 /** CGEvent 탭 콜백은 self를 못 쓰므로, Caps Lock down/up 쌍을 여기 둔다. */
 private var capsLockTapDown = false
+private var clearingStuckCapsLock = false
 
 func resetCapsLockTapDown() {
     capsLockTapDown = false
+}
+
+/** 한/A용 Caps Lock이 OS 대문자 잠금으로 남는 것을 막는다. */
+private func stripAndClearCapsLock(_ event: CGEvent) {
+    if event.flags.contains(.maskAlphaShift) {
+        var flags = event.flags
+        flags.remove(.maskAlphaShift)
+        event.flags = flags
+        if !clearingStuckCapsLock {
+            clearingStuckCapsLock = true
+            setKeyboardCapsLock(enabled: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(200)) {
+                clearingStuckCapsLock = false
+            }
+        }
+    }
 }
 
 enum HotKeyMonitorError: Error, CustomStringConvertible {
@@ -80,15 +97,25 @@ class HotKeyMonitor {
                     return Unmanaged.passUnretained(event)
                 }
 
+                // 한/A 단축키가 Caps Lock이면 현재 IME와 무관하게 OS 대문자 잠금을 끈다.
+                // ABC에 머문 채 누르면 속이 가로채지 못해 영어가 대문자로만 남는다.
+                if Preferences.rotateShortcuts.contains(.capsLock) {
+                    stripAndClearCapsLock(event)
+                }
+
                 let keycode = event.getIntegerValueField(.keyboardEventKeycode)
                 if Preferences.rotateShortcuts.contains(.capsLock)
-                    && keycode == Int64(kVK_CapsLock)
-                    && isSokIMCurrentInputSource() {
+                    && keycode == Int64(kVK_CapsLock) {
                     // Caps Lock down/up이 쌍으로 온다. 한/A는 down에서만 전환하고, OS 대소문자는 흡수한다.
                     if !capsLockTapDown {
                         capsLockTapDown = true
-                        notice("Caps Lock down → 한/A")
-                        appDelegate()?.rotateFromShortcut()
+                        if isSokIMCurrentInputSource() {
+                            notice("Caps Lock down → 한/A")
+                            appDelegate()?.rotateFromShortcut()
+                        } else {
+                            notice("Caps Lock down → 속 한글")
+                            appDelegate()?.selectSokIMHangulFromShortcut()
+                        }
                     } else {
                         capsLockTapDown = false
                         notice("Caps Lock up")
@@ -96,6 +123,11 @@ class HotKeyMonitor {
                     }
                     setKeyboardCapsLock(enabled: false)
                     return nil
+                }
+
+                // 채팅 키 이름 없이, ABC에 남은 게임에서 키가 하나 떨어지면 속을 되돌린다.
+                if type == .keyDown && !isSokIMCurrentInputSource() {
+                    appDelegate()?.scheduleRawKoreanIMERecover()
                 }
 
                 let flags = Int32(event.flags.rawValue)

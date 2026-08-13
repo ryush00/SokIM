@@ -38,6 +38,22 @@ import InputMethodKit
  | Slack | ... NSMarkedClauseSegment ... |
  | Excel | ... |
  */
+func markedTextAttributes(for sender: IMKTextInput) -> [String] {
+    sender.validAttributesForMarkedText() as? [String] ?? []
+}
+
+/** 표준 앱은 밑줄·절 속성이 있다. GLFW IME는 비어 있거나 NSDictationHiliteMarkedText만 준다. */
+func usesRawMarkedText(_ sender: IMKTextInput) -> Bool {
+    let attrs = markedTextAttributes(for: sender)
+    if attrs.contains("NSUnderline")
+        || attrs.contains("NSMarkedClauseSegment")
+        || attrs.contains("NSFont")
+        || attrs.contains("NSTextAlternatives") {
+        return false
+    }
+    return true
+}
+
 func strategy(for sender: IMKTextInput) -> Strategy.Type {
     debug()
     if let bundleIdentifier = sender.bundleIdentifier(),
@@ -46,7 +62,7 @@ func strategy(for sender: IMKTextInput) -> Strategy.Type {
         return MarkedStrategy.self
     }
 
-    let attributes = sender.validAttributesForMarkedText() as? [String] ?? []
+    let attributes = markedTextAttributes(for: sender)
     debug("validAttributesForMarkedText: \(attributes)")
 
     if attributes.contains("NSTextAlternatives")

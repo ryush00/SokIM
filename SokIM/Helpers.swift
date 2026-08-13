@@ -149,14 +149,10 @@ func getMappedModifierUsage(_ usage: UInt32, _ device: IOHIDDevice) -> UInt32 {
 
 // MARK: - 현재 입력 소스
 
-func isSokIMCurrentInputSource() -> Bool {
-    if appDelegate()?.isIMEActive == true {
-        return true
-    }
-
+func currentInputSourceIDs() -> [String] {
     guard let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else {
         notice("TIS current 없음")
-        return false
+        return []
     }
 
     var ids: [String] = []
@@ -169,8 +165,34 @@ func isSokIMCurrentInputSource() -> Bool {
     if let opaque = TISGetInputSourceProperty(current, kTISPropertyBundleID) {
         ids.append(Unmanaged<CFString>.fromOpaque(opaque).takeUnretainedValue() as String)
     }
+    return ids
+}
+
+func isAppleKoreanInputSource() -> Bool {
+    currentInputSourceIDs().contains { $0.contains("com.apple.inputmethod.Korean") }
+}
+
+func isSokIMCurrentInputSource() -> Bool {
+    let ids = currentInputSourceIDs()
     notice("current input: \(ids.joined(separator: ", "))")
-    return ids.contains { $0.contains("kiding.inputmethod.sok") }
+    if ids.contains(where: { $0.contains("kiding.inputmethod.sok") }) {
+        return true
+    }
+    // ABC/애플 두벌식이면 속이 아니다. isIMEActive만으로 참으로 보면
+    // 영어 모드인데도 한/A·조합을 속이 계속 가져간다.
+    if ids.contains(where: { $0.contains("keylayout") || $0.contains("com.apple.inputmethod.Korean") }) {
+        return false
+    }
+    return appDelegate()?.isIMEActive == true
+}
+
+func containsHangul(_ text: String?) -> Bool {
+    guard let text else { return false }
+    return text.unicodeScalars.contains { scalar in
+        (0x1100...0x11FF).contains(scalar.value)
+            || (0x3130...0x318F).contains(scalar.value)
+            || (0xAC00...0xD7AF).contains(scalar.value)
+    }
 }
 
 // MARK: - 물리 키보드 Caps Lock 상태
