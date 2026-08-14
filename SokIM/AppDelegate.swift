@@ -430,12 +430,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         let tuple = state.engine.eventToTuple(event)
 
+        // HID modifier keyUp을 놓치면 State에는 Shift가 눌린 채 남을 수 있다.
+        // 현재 영문 키의 대소문자는 NSEvent modifierFlags를 기준으로 다시 계산한다.
+        if state.engine == state.engines.A, let tuple {
+            state = oldState
+            state.next(tuple)
+        }
+
         // 영문 엔진인데 NSEvent에 한글 자모가 실리면 OS로 넘기지 않는다.
         // IME on/off 직후 event.characters가 ㄹ인데 composed는 f인 경우가 있다.
         if state.engine == state.engines.A && containsHangul(event.characters) {
-            if state.composed == oldState.composed && state.composing == oldState.composing, let tuple {
-                state.next(tuple)
-            }
             if !state.composed.isEmpty || !state.composing.isEmpty {
                 _ = strategy.next(from: state, to: sender, with: oldState.composing)
                 state.clear(composed: true, composing: false)
