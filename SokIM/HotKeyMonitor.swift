@@ -3,10 +3,24 @@ import Carbon.HIToolbox
 
 /** CGEvent 탭 콜백은 self를 못 쓰므로, Caps Lock down/up 쌍을 여기 둔다. */
 private var capsLockTapDown = false
+private var capsLockHIDHandledAt: CFTimeInterval?
 private var clearingStuckCapsLock = false
 
 func resetCapsLockTapDown() {
     capsLockTapDown = false
+}
+
+/** HID가 먼저 처리한 Caps Lock down을 뒤늦은 CGEvent가 다시 전환하지 않게 한다. */
+func markCapsLockHandledByHID() {
+    capsLockHIDHandledAt = CACurrentMediaTime()
+}
+
+private func consumeCapsLockHandledByHID() -> Bool {
+    guard let handledAt = capsLockHIDHandledAt else { return false }
+    capsLockHIDHandledAt = nil
+
+    // 물리 Caps Lock은 현재 환경에서 CGEvent가 HID보다 약 80ms 늦게 온다.
+    return CACurrentMediaTime() - handledAt <= 0.25
 }
 
 /** 한/A용 Caps Lock이 OS 대문자 잠금으로 남는 것을 막는다. */
@@ -109,7 +123,9 @@ class HotKeyMonitor {
                     // Caps Lock down/up이 쌍으로 온다. 한/A는 down에서만 전환하고, OS 대소문자는 흡수한다.
                     if !capsLockTapDown {
                         capsLockTapDown = true
-                        if isSokIMCurrentInputSource() {
+                        if consumeCapsLockHandledByHID() {
+                            notice("Caps Lock down → HID already handled")
+                        } else if isSokIMCurrentInputSource() {
                             notice("Caps Lock down → 한/A")
                             appDelegate()?.rotateFromShortcut()
                         } else {

@@ -192,6 +192,7 @@ class InputMonitor {
 
         // usage가 modifier인 경우
         if let key = ModifierUsage(rawValue: usage) {
+            let wasKeyDown = modifier[key] == .keyDown
             modifier[key] = type
 
             // 별도 처리: Control, Command, Caps Lock 입력되면 조합 종료
@@ -216,8 +217,13 @@ class InputMonitor {
             }
 
             // 별도 처리: Caps Lock: 한/A 즉시 전환. LED 쓰기는 백그라운드에서 처리
-            if (type, key) == (.keyDown, .capsLock) {
+            if (type, key) == (.keyDown, .capsLock) && !wasKeyDown {
                 if Preferences.rotateShortcuts.contains(.capsLock) {
+                    let delegate = appDelegate()
+                    if delegate != nil {
+                        markCapsLockHandledByHID()
+                    }
+
                     if isSokIMCurrentInputSource() {
                         /* 한/A 전환이 Caps Lock인 경우 800ms 이상 누르고 있으면 활성화 */
                         let enabled = getKeyboardCapsLock()
@@ -242,18 +248,21 @@ class InputMonitor {
                         }
                         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(800), execute: capsLockTimer)
 
-                        // 한/A는 CGEvent 탭의 Caps Lock down에서만 전환한다.
-                        // 탭이 없으면 HID keyDown이 물리 누름당 한 번이므로 여기서 전환한다.
+                        // HID keyDown에서 즉시 전환한다. 뒤늦은 CGEvent는 HotKeyMonitor에서 중복 처리하지 않는다.
                         if canCapsLockRotate {
-                            if appDelegate()?.hasEventTap() != true {
-                                appDelegate()?.rotateFromShortcut()
-                            }
+                            notice("Caps Lock HID down → 한/A")
+                            delegate?.rotateFromShortcut()
                         } else {
                             canCapsLockRotate = true
+                            notice("Caps Lock HID down → 전환 생략")
                         }
                     } else {
-                        debug("속 입력기가 아님: Caps Lock 한/A 생략, 물리 Caps Lock은 끈다")
-                        setKeyboardCapsLock(enabled: false)
+                        notice("Caps Lock HID down → 속 한글")
+                        if let delegate {
+                            delegate.selectSokIMHangulFromShortcut()
+                        } else {
+                            setKeyboardCapsLock(enabled: false)
+                        }
                     }
                 }
                 // 그 외의 경우 일반 반전 처리
